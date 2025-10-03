@@ -1,109 +1,70 @@
-"""
-Run-this-in-your-IDE version
-- No CLI args needed.
-- Uses values from config.py
-- Pipeline: (optional) ingest -> indicators/strategy -> plots
-"""
 
-from __future__ import annotations
-
+# main.py — single run script (no CLI). Just: python3 main.py
+import threading
+import time
 import sys
-import traceback
+import webbrowser
 
-from config import (
-    DEFAULT_INSTRUMENT_TOKEN, DEFAULT_FROM, DEFAULT_TO, DEFAULT_INTERVAL,
-    RSI_WINDOW, RSI_OVERSOLD, RSI_OVERBOUGHT, BB_WINDOW, BB_STD,
-)
-from db import init_schema, load_ohlc
-from ingest import ingest_to_db
-from strategy import make_indicators, rsi_bb_signals
-from plotter import plot_price_bbands_signals, plot_equity_curves
+from auth import run_server, ensure_token_interactive, load_access_token
+from ingest import fetch_and_store_banknifty_daily
+import db
 
-# --- Simple toggles for IDE runs ---
-RUN_INGEST = True           # set False if you already ingested data
-RUN_PLOT_PRICE = True
-RUN_PLOT_EQUITY = True
+BANNER = """
+=== Zerodha Auth + BANKNIFTY Ingest ===
+This script will:
+  1) start the local auth server (http://127.0.0.1:8750)
+  2) if needed, open the Zerodha login URL
+  3) wait for the token to be saved at /kite/callback
+  4) download ~2 years of BANKNIFTY daily OHLC into SQLite
+"""
 
-# Optional: override defaults from config.py (leave as None to use config values)
-OVERRIDE_TOKEN: int | None = None
-OVERRIDE_FROM: str | None = None
-OVERRIDE_TO: str | None = None
-OVERRIDE_INTERVAL: str | None = None
+def start_server_in_background():
+    t = threading.Thread(target=run_server, daemon=True)
+    t.start()
+    # small wait to let Flask boot up
+    for _ in range(30):
+        time.sleep(0.1)
+    return t
 
-# Optional: indicator/strategy knobs (None = use config defaults)
-OVERRIDE_RSI_WINDOW: int | None = None
-OVERRIDE_RSI_OVERSOLD: float | None = None
-OVERRIDE_RSI_OVERBOUGHT: float | None = None
-OVERRIDE_BB_WINDOW: int | None = None
-OVERRIDE_BB_STD: float | None = None
+def wait_for_token(timeout_sec=180):
+    """Poll for access token to appear (written by /kite/callback)."""
+    start = time.time()
+    while time.time() - start < timeout_sec:
+        tok = load_access_token()
+        if tok:
+            return tok
+        time.sleep(1.0)
+    return ""
 
+def main():
+    print(BANNER)
+    # Init DB first so we fail early if something's off with permissions
+    db.init()
 
-def _val(v, fallback):
-    return v if v is not None else fallback
+    print("[1/4] Starting local auth server on http://127.0.0.1:8750 ...")
+    start_server_in_background()
 
+    token = load_access_token()
+    if not token:
+        print("[2/4] No access token found. Launching Zerodha login flow...")
+        url = ensure_token_interactive(open_browser=True)
+        print("If the browser didn't open automatically, open this URL:\n", url)
+        print("After login, you'll be redirected to /kite/callback and the token will be saved.")
 
-def run_pipeline():
-    # 1) Config resolution
-    token = _val(OVERRIDE_TOKEN, DEFAULT_INSTRUMENT_TOKEN)
-    from_date = _val(OVERRIDE_FROM, DEFAULT_FROM)
-    to_date = _val(OVERRIDE_TO, DEFAULT_TO)
-    interval = _val(OVERRIDE_INTERVAL, DEFAULT_INTERVAL)
+        print("[3/4] Waiting for token to be saved (up to 30 seconds)...")
+        token = wait_for_token(timeout_sec=30)
+        if not token:
+            print("❌ Token not received. Please re-run and complete the login promptly.")
+            sys.exit(1)
+        print("✅ Access token saved.")
 
-    rsi_window = _val(OVERRIDE_RSI_WINDOW, RSI_WINDOW)
-    rsi_oversold = _val(OVERRIDE_RSI_OVERSOLD, RSI_OVERSOLD)
-    rsi_overbought = _val(OVERRIDE_RSI_OVERBOUGHT, RSI_OVERBOUGHT)
-    bb_window = _val(OVERRIDE_BB_WINDOW, BB_WINDOW)
-    bb_std = _val(OVERRIDE_BB_STD, BB_STD)
+    else:
+        print("✅ Access token already present.")
 
-    # 2) Ensure DB schema
-    init_schema()
-
-    # 3) Ingest (optional)
-    if RUN_INGEST:
-        print(f"[INGEST] token={token} {from_date}→{to_date} interval={interval}")
-        df_ing = ingest_to_db(token, from_date, to_date, interval)
-        print(f"[INGEST] rows fetched: {len(df_ing)}")
-
-    # 4) Load from DB
-    raw = load_ohlc(token)
-    if raw.empty:
-        raise RuntimeError("No OHLC data in DB. Set RUN_INGEST=True or adjust dates/token.")
-    print(f"[LOAD] rows: {len(raw)}  span: {raw['date'].min()} → {raw['date'].max()}")
-
-    # 5) Indicators
-    ind = make_indicators(
-        raw,
-        rsi_window=rsi_window,
-        bb_window=bb_window,
-        bb_std=bb_std,
-    )
-
-    # 6) Strategy / backtest
-    out = rsi_bb_signals(
-        ind,
-        rsi_oversold=rsi_oversold,
-        rsi_overbought=rsi_overbought,
-    )
-
-    # 7) Summary
-    final_strat = float(out["strat_eq"].iloc[-1])
-    final_bh = float(out["bh_eq"].iloc[-1])
-    print(
-        f"[RESULT] Bars={len(out)} | Strategy final eq={final_strat:.4f} | Buy&Hold final eq={final_bh:.4f}"
-    )
-
-    # 8) Plots
-    if RUN_PLOT_PRICE:
-        plot_price_bbands_signals(out, title="Price + Bollinger + RSI signals")
-    if RUN_PLOT_EQUITY:
-        plot_equity_curves(out, title="Equity Curves: Strategy vs Buy & Hold")
-
+    print("[4/4] Ingesting ~2 years of BANKNIFTY daily OHLC into SQLite...")
+    n = fetch_and_store_banknifty_daily(years=2)
+    print(f"✅ Ingest complete. Rows inserted/updated: {n}")
+    print("Done. You can now explore the data with db.load_ohlc_df('BANKNIFTY','day').")
 
 if __name__ == "__main__":
-    try:
-        run_pipeline()
-    except Exception as e:
-        print("\n[ERROR]".ljust(10, "-"))
-        print(str(e))
-        traceback.print_exc()
-        sys.exit(1)
+    main()
