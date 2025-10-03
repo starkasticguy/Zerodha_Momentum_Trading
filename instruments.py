@@ -1,4 +1,4 @@
-# instruments.py — cache instruments and resolve BANKNIFTY token robustly
+# instruments.py — cache instruments and resolve BANKNIFTY token
 import pandas as pd
 import re
 from typing import Optional
@@ -16,8 +16,7 @@ def download_and_store_instruments(access_token: str) -> pd.DataFrame:
     return df
 
 def _norm(s: str) -> str:
-    import re as _re
-    return _re.sub(r"\W+", "", (s or "").upper())
+    return re.sub(r"\W+", "", (s or "").upper())
 
 def find_banknifty_token(df: Optional[pd.DataFrame] = None) -> Optional[int]:
     if df is None:
@@ -27,7 +26,6 @@ def find_banknifty_token(df: Optional[pd.DataFrame] = None) -> Optional[int]:
     df = df.copy()
     df["n_tradingsymbol"] = df["tradingsymbol"].astype(str).map(_norm)
     df["n_name"] = df["name"].astype(str).map(_norm)
-    # Prefer indices
     is_index = df["instrument_type"].astype(str).str.upper().eq("INDICES")
     candidates = ["NIFTYBANK", "BANKNIFTY", "NSE:NIFTYBANK", "NSE:BANKNIFTY"]
     mask = is_index & (
@@ -37,7 +35,6 @@ def find_banknifty_token(df: Optional[pd.DataFrame] = None) -> Optional[int]:
     m = df.loc[mask]
     if not m.empty:
         return int(m.iloc[0]["instrument_token"])
-    # fallback
     mask2 = df["n_tradingsymbol"].str.contains("BANK") & df["n_tradingsymbol"].str.contains("NIFT")
     if mask2.any():
         return int(df.loc[mask2].iloc[0]["instrument_token"])

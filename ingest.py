@@ -13,7 +13,7 @@ def fetch_and_store_banknifty_daily(years: int = 2) -> int:
     db.init()
     access_token = load_access_token()
     if not access_token:
-        raise SystemExit("No access token found. Run: python -m main login (after runserver)." )
+        raise SystemExit("No access token found. Please run main.py and complete login.")
 
     # Refresh instruments and resolve token
     df_instr = download_and_store_instruments(access_token)
@@ -32,7 +32,7 @@ def fetch_and_store_banknifty_daily(years: int = 2) -> int:
     cursor = from_dt
     rows: List[Dict[str, Any]] = []
     while cursor < to_dt:
-        window_end = min(cursor + timedelta(days=90), to_dt)  # chunking to respect limits
+        window_end = min(cursor + timedelta(days=90), to_dt)  # chunking
         data = kite.historical_data(
             instrument_token=token,
             from_date=cursor,

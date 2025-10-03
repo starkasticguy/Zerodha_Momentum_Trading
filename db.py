@@ -1,9 +1,8 @@
-# db.py — tiny SQLite wrapper
+# db.py — simple SQLite helpers for OHLC & instruments
 import sqlite3
 from pathlib import Path
 import pandas as pd
 from typing import Iterable, Dict, Any
-
 from config import DB_PATH
 
 def get_conn():
@@ -13,7 +12,7 @@ def get_conn():
 def init():
     with get_conn() as con:
         con.execute(
-            '''
+            """
             CREATE TABLE IF NOT EXISTS ohlc (
               ts TIMESTAMP NOT NULL,
               open REAL NOT NULL,
@@ -27,10 +26,10 @@ def init():
               interval TEXT NOT NULL,
               PRIMARY KEY (ts, instrument_token, interval)
             )
-            '''
+            """
         )
         con.execute(
-            '''
+            """
             CREATE TABLE IF NOT EXISTS instruments (
               instrument_token INTEGER PRIMARY KEY,
               exchange_token INTEGER,
@@ -45,29 +44,33 @@ def init():
               segment TEXT,
               exchange TEXT
             )
-            '''
+            """
         )
         con.commit()
 
 def upsert_ohlc(rows: Iterable[Dict[str, Any]]):
+    rows = list(rows)
+    if not rows:
+        return 0
     with get_conn() as con:
         con.executemany(
-            '''
+            """
             INSERT OR REPLACE INTO ohlc
             (ts, open, high, low, close, volume, oi, instrument_token, symbol, interval)
             VALUES (:date, :open, :high, :low, :close, :volume, :oi, :instrument_token, :symbol, :interval)
-            ''',
-            rows
+            """,
+            rows,
         )
         con.commit()
+    return len(rows)
 
 def load_ohlc_df(symbol: str, interval: str = "day") -> pd.DataFrame:
     with get_conn() as con:
         return pd.read_sql_query(
             "SELECT * FROM ohlc WHERE symbol=? AND interval=? ORDER BY ts",
             con,
-            params=(symbol, interval,),
-            parse_dates=["ts"]
+            params=(symbol, interval),
+            parse_dates=["ts"],
         )
 
 def replace_instruments_df(df: pd.DataFrame):
