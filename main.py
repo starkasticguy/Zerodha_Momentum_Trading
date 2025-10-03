@@ -1,70 +1,109 @@
 """
-Project CLI — SQL-only pipeline for NIFTY BANK 5-minute data.
-
-Subcommands:
-    python main.py ingest        # pull ~2 years (or resume) into SQLite
-    python main.py rsi           # compute RSI-14 and persist to SQL
-    python main.py status        # show simple table stats
-
-Environment:
-    KITE_API_KEY, KITE_API_SECRET must be set (used by auth.get_kite())
+Run-this-in-your-IDE version
+- No CLI args needed.
+- Uses values from config.py
+- Pipeline: (optional) ingest -> indicators/strategy -> plots
 """
+
 from __future__ import annotations
 
-import argparse
+import sys
+import traceback
 
-from ingest import ingest
-from ops import compute_and_persist_rsi
-from storage import SQLiteStore
-KITE_API_KEY = "pi2xk2iokf0u2nt3"
-KITE_API_SECRET = "ssifv93g7g6xo9lofpduwwzy4n45q3d2"
+from config import (
+    DEFAULT_INSTRUMENT_TOKEN, DEFAULT_FROM, DEFAULT_TO, DEFAULT_INTERVAL,
+    RSI_WINDOW, RSI_OVERSOLD, RSI_OVERBOUGHT, BB_WINDOW, BB_STD,
+)
+from db import init_schema, load_ohlc
+from ingest import ingest_to_db
+from strategy import make_indicators, rsi_bb_signals
+from plotter import plot_price_bbands_signals, plot_equity_curves
 
-def cmd_ingest(args):
-    ingest(days=args.days, db_path=args.db, table=args.table)
+# --- Simple toggles for IDE runs ---
+RUN_INGEST = True           # set False if you already ingested data
+RUN_PLOT_PRICE = True
+RUN_PLOT_EQUITY = True
+
+# Optional: override defaults from config.py (leave as None to use config values)
+OVERRIDE_TOKEN: int | None = None
+OVERRIDE_FROM: str | None = None
+OVERRIDE_TO: str | None = None
+OVERRIDE_INTERVAL: str | None = None
+
+# Optional: indicator/strategy knobs (None = use config defaults)
+OVERRIDE_RSI_WINDOW: int | None = None
+OVERRIDE_RSI_OVERSOLD: float | None = None
+OVERRIDE_RSI_OVERBOUGHT: float | None = None
+OVERRIDE_BB_WINDOW: int | None = None
+OVERRIDE_BB_STD: float | None = None
 
 
-def cmd_rsi(args):
-    compute_and_persist_rsi(db_path=args.db, table=args.table, only_missing=args.only_missing)
+def _val(v, fallback):
+    return v if v is not None else fallback
 
 
-def cmd_status(args):
-    store = SQLiteStore(db_path=args.db, table=args.table)
-    con = store.connect()
-    try:
-        n = store.count(con)
-        last = store.last_timestamp(con)
-        print("DB:", args.db)
-        print("Table:", args.table)
-        print("Rows:", n)
-        print("Last timestamp:", last)
-    finally:
-        con.close()
+def run_pipeline():
+    # 1) Config resolution
+    token = _val(OVERRIDE_TOKEN, DEFAULT_INSTRUMENT_TOKEN)
+    from_date = _val(OVERRIDE_FROM, DEFAULT_FROM)
+    to_date = _val(OVERRIDE_TO, DEFAULT_TO)
+    interval = _val(OVERRIDE_INTERVAL, DEFAULT_INTERVAL)
 
+    rsi_window = _val(OVERRIDE_RSI_WINDOW, RSI_WINDOW)
+    rsi_oversold = _val(OVERRIDE_RSI_OVERSOLD, RSI_OVERSOLD)
+    rsi_overbought = _val(OVERRIDE_RSI_OVERBOUGHT, RSI_OVERBOUGHT)
+    bb_window = _val(OVERRIDE_BB_WINDOW, BB_WINDOW)
+    bb_std = _val(OVERRIDE_BB_STD, BB_STD)
 
-def parse_args():
-    p = argparse.ArgumentParser(description="NIFTY BANK SQL-only data pipeline")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    # 2) Ensure DB schema
+    init_schema()
 
-    p_ing = sub.add_parser("ingest", help="Ingest ~2 years of 5m data")
-    p_ing.add_argument("--days", type=int, default=730, help="Lookback days if table empty")
-    p_ing.add_argument("--db", default="market_data.db", help="SQLite db path")
-    p_ing.add_argument("--table", default="banknifty_5m", help="Table name")
-    p_ing.set_defaults(func=cmd_ingest)
+    # 3) Ingest (optional)
+    if RUN_INGEST:
+        print(f"[INGEST] token={token} {from_date}→{to_date} interval={interval}")
+        df_ing = ingest_to_db(token, from_date, to_date, interval)
+        print(f"[INGEST] rows fetched: {len(df_ing)}")
 
-    p_rsi = sub.add_parser("rsi", help="Compute RSI-14 and persist")
-    p_rsi.add_argument("--db", default="market_data.db", help="SQLite db path")
-    p_rsi.add_argument("--table", default="banknifty_5m", help="Table name")
-    p_rsi.add_argument("--only-missing", action="store_true", help="Only fill NULL RSI values")
-    p_rsi.set_defaults(func=cmd_rsi)
+    # 4) Load from DB
+    raw = load_ohlc(token)
+    if raw.empty:
+        raise RuntimeError("No OHLC data in DB. Set RUN_INGEST=True or adjust dates/token.")
+    print(f"[LOAD] rows: {len(raw)}  span: {raw['date'].min()} → {raw['date'].max()}")
 
-    p_stat = sub.add_parser("status", help="Show row count and last timestamp")
-    p_stat.add_argument("--db", default="market_data.db", help="SQLite db path")
-    p_stat.add_argument("--table", default="banknifty_5m", help="Table name")
-    p_stat.set_defaults(func=cmd_status)
+    # 5) Indicators
+    ind = make_indicators(
+        raw,
+        rsi_window=rsi_window,
+        bb_window=bb_window,
+        bb_std=bb_std,
+    )
 
-    return p.parse_args()
+    # 6) Strategy / backtest
+    out = rsi_bb_signals(
+        ind,
+        rsi_oversold=rsi_oversold,
+        rsi_overbought=rsi_overbought,
+    )
+
+    # 7) Summary
+    final_strat = float(out["strat_eq"].iloc[-1])
+    final_bh = float(out["bh_eq"].iloc[-1])
+    print(
+        f"[RESULT] Bars={len(out)} | Strategy final eq={final_strat:.4f} | Buy&Hold final eq={final_bh:.4f}"
+    )
+
+    # 8) Plots
+    if RUN_PLOT_PRICE:
+        plot_price_bbands_signals(out, title="Price + Bollinger + RSI signals")
+    if RUN_PLOT_EQUITY:
+        plot_equity_curves(out, title="Equity Curves: Strategy vs Buy & Hold")
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    args.func(args)
+    try:
+        run_pipeline()
+    except Exception as e:
+        print("\n[ERROR]".ljust(10, "-"))
+        print(str(e))
+        traceback.print_exc()
+        sys.exit(1)
