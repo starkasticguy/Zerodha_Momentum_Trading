@@ -1,31 +1,39 @@
-# ingest.py
-from datetime import datetime
+# strategy.py
 import pandas as pd
-from broker import get_kite
-from db import init_schema, upsert_ohlc
-from config import DEFAULT_INTERVAL
+from indicators import rsi, bollinger_bands
 
-def fetch_historical(instrument_token: int, from_date: str, to_date: str, interval: str = DEFAULT_INTERVAL) -> pd.DataFrame:
-    kite = get_kite()
-    data = kite.historical_data(
-        instrument_token=instrument_token,
-        from_date=from_date,
-        to_date=to_date,
-        interval=interval,
-        continuous=False,
-        oi=False
-    )
-    df = pd.DataFrame(data)
-    # Standardize columns
-    df.rename(columns={"date":"date","open":"open","high":"high","low":"low","close":"close","volume":"volume"}, inplace=True)
-    # Ensure datetime & just date for daily
-    df["date"] = pd.to_datetime(df["date"])
-    if interval == "day":
-        df["date"] = df["date"].dt.tz_localize(None)
-    return df[["date","open","high","low","close","volume"]]
+def make_indicators(df: pd.DataFrame, rsi_window=14, bb_window=20, bb_std=2.0) -> pd.DataFrame:
+    out = df.copy()
+    out["rsi"] = rsi(out["close"], window=rsi_window)
+    ma, u, l = bollinger_bands(out["close"], window=bb_window, num_std=bb_std)
+    out["bb_mid"] = ma
+    out["bb_up"] = u
+    out["bb_lo"] = l
+    return out
 
-def ingest_to_db(instrument_token: int, from_date: str, to_date: str, interval: str = DEFAULT_INTERVAL):
-    init_schema()
-    df = fetch_historical(instrument_token, from_date, to_date, interval)
-    upsert_ohlc(instrument_token, df)
-    return df
+def rsi_bb_signals(df: pd.DataFrame, rsi_oversold=30, rsi_overbought=70) -> pd.DataFrame:
+    out = df.copy()
+
+    # Signals
+    out["buy_sig"]  = (out["close"] <= out["bb_lo"]) & (out["rsi"] < rsi_oversold)
+    out["sell_sig"] = (out["close"] >= out["bb_up"]) & (out["rsi"] > rsi_overbought)
+
+    # Position logic (long/flat)
+    pos = 0
+    positions = []
+    for buy, sell in zip(out["buy_sig"].fillna(False), out["sell_sig"].fillna(False)):
+        if sell:
+            pos = 0
+        elif buy:
+            pos = 1
+        positions.append(pos)
+    out["position"] = positions
+
+    # Returns
+    out["ret"] = out["close"].pct_change().fillna(0.0)
+    out["strat_ret"] = out["position"].shift(1).fillna(0.0) * out["ret"]
+    out["bh_ret"] = out["ret"]
+
+    out["strat_eq"] = (1 + out["strat_ret"]).cumprod()
+    out["bh_eq"]    = (1 + out["bh_ret"]).cumprod()
+    return out

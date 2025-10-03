@@ -99,6 +99,12 @@ def ingest(days: int, db_path: str, table: str) -> int:
     con.close()
     print(f"[ingest] inserted total: {inserted_total}")
     return inserted_total
+def ingest_to_db(instrument_token: int, from_date: str, to_date: str, interval: str = DEFAULT_INTERVAL):
+    init_schema()
+    df = fetch_historical(instrument_token, from_date, to_date, interval)
+    if not df.empty:
+        upsert_ohlc(instrument_token, df)
+    return df
 
 
 def parse_args():
